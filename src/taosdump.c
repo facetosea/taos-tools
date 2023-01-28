@@ -6012,6 +6012,7 @@ static int64_t dumpInAvroDataImpl(
         RecordSchema *recordSchema,
         char *fileName) {
     TAOS_STMT *stmt = NULL;
+    int64_t    tNowUs = toolsGetTimestampUs();
 #ifdef WEBSOCKET
     WS_STMT *ws_stmt = NULL;
     if (g_args.cloud || g_args.restful) {
@@ -6036,36 +6037,29 @@ static int64_t dumpInAvroDataImpl(
 #ifdef WEBSOCKET
     }
 #endif
-    TableDes *tableDes = (TableDes *)calloc(1, sizeof(TableDes)
+    int64_t   success = 0;
+    int64_t   failed = 0;
+    int64_t   count = 0;
+    int64_t   waitCount = 0;
+
+    TableDes *tableDes = NULL;
+    char *stmtBuffer = NULL;
+    char *bindArray = NULL;
+    char *escapedTbName = NULL;
+
+    tableDes = (TableDes *)calloc(1, sizeof(TableDes)
             + sizeof(ColDes) * TSDB_MAX_COLUMNS);
     if (NULL == tableDes) {
         errorPrint("%s() LN%d, memory allocation failed!\n", __func__, __LINE__);
-#ifdef WEBSOCKET
-        if (g_args.cloud || g_args.restful) {
-            ws_stmt_close(ws_stmt);
-        } else {
-#endif
-            taos_stmt_close(stmt);
-#ifdef WEBSOCKET
-        }
-#endif
-        return -1;
+      failed = 1;
+      goto preExit;
     }
 
-    char *stmtBuffer = calloc(1, TSDB_MAX_ALLOWED_SQL_LEN);
+    stmtBuffer = calloc(1, TSDB_MAX_ALLOWED_SQL_LEN);
     if (NULL == stmtBuffer) {
         errorPrint("%s() LN%d, memory allocation failed!\n", __func__, __LINE__);
-        free(tableDes);
-#ifdef WEBSOCKET
-        if (g_args.cloud || g_args.restful) {
-            ws_stmt_close(ws_stmt);
-        } else {
-#endif
-            taos_stmt_close(stmt);
-#ifdef WEBSOCKET
-        }
-#endif
-        return -1;
+      failed = 1;
+      goto preExit;
     }
 
     char *pstr = stmtBuffer;
@@ -6078,8 +6072,8 @@ static int64_t dumpInAvroDataImpl(
         onlyCol++;
     }
     pstr += sprintf(pstr, ")");
-    debugPrint("%s() LN%d, stmt buffer: %s\n",
-            __func__, __LINE__, stmtBuffer);
+    infoPrint("%s() LN%d, stmt buffer: %s cost:%d us\n", __func__, __LINE__, stmtBuffer,
+               getTimeCostUsfromLastCall(&tNowUs));
 
 #ifdef WEBSOCKET
     int code;
@@ -6089,22 +6083,15 @@ static int64_t dumpInAvroDataImpl(
                     " ws_taos: %p, code: 0x%08x, reason: %s\n",
                     __func__, __LINE__,
                     taos, code, ws_errstr(ws_stmt));
-
-            free(stmtBuffer);
-            free(tableDes);
-            ws_stmt_close(ws_stmt);
-            return -1;
+            goto excepExit;
         }
     } else {
 #endif
         if (0 != taos_stmt_prepare(stmt, stmtBuffer, 0)) {
             errorPrint("Failed to execute taos_stmt_prepare(). reason: %s\n",
                     taos_stmt_errstr(stmt));
-
-            free(stmtBuffer);
-            free(tableDes);
-            taos_stmt_close(stmt);
-            return -1;
+          failed = 1;
+          goto preExit;
         }
 #ifdef WEBSOCKET
     }
@@ -6114,34 +6101,53 @@ static int64_t dumpInAvroDataImpl(
     avro_value_t value;
     avro_generic_value_new(value_class, &value);
 
-    char *bindArray =
-            calloc(1, sizeof(TAOS_MULTI_BIND) * onlyCol);
+    bindArray = calloc(1, sizeof(TAOS_MULTI_BIND) * onlyCol);
     if (NULL == bindArray) {
         errorPrint("%s() LN%d, memory allocation failed!\n", __func__, __LINE__);
-        free(stmtBuffer);
-        free(tableDes);
-#ifdef WEBSOCKET
-        if (g_args.cloud || g_args.restful) {
-            ws_stmt_close(ws_stmt);
-        } else {
-#endif
-            taos_stmt_close(stmt);
-#ifdef WEBSOCKET
-        }
-#endif
-        return -1;
+      failed = 1;
+      goto preExit;
     }
-
-    int64_t success = 0;
-    int64_t failed = 0;
-    int64_t count = 0;
 
     int stmt_count = 0;
     bool printDot = true;
+    infoPrint("%s() LN%d, stmt buffer: %s while will cost:%d us\n", __func__, __LINE__, stmtBuffer,
+              getTimeCostUsfromLastCall(&tNowUs));
+
+    escapedTbName = calloc(1, TSDB_DB_NAME_LEN + TSDB_TABLE_NAME_LEN + 3);
+    if (NULL == escapedTbName) {
+      errorPrint("%s() LN%d, memory allocation failed!\n", __func__, __LINE__);
+      failed = 1;
+      goto preExit;
+    }
+
+    char *tbNameOutWhile = NULL;
+    if (g_dumpInLooseModeFlag) {
+      tbNameOutWhile = malloc(TSDB_TABLE_NAME_LEN);
+      if (NULL == escapedTbName) {
+        errorPrint("%s() LN%d, memory allocation failed!\n", __func__, __LINE__);
+        failed = 1;
+        goto preExit;
+      }
+
+      char *dupSeq = strdup(fileName);
+      char *running = dupSeq;
+      strsep(&running, ".");
+      char *tb = strsep(&running, ".");
+
+      strcpy(tbNameOutWhile, tb);
+      free(dupSeq);
+    }
+
+    
+    int t1 = 0;
+    int t2 = 0;
+    int t3 = 0;
+    int t4 = 0;
     while (!avro_file_reader_read_value(reader, &value)) {
         avro_value_t tbname_value, tbname_branch;
+        char *       tbName = NULL;
+        memset(escapedTbName, 0, TSDB_DB_NAME_LEN + TSDB_TABLE_NAME_LEN + 3);
 
-        char *tbName = NULL;
         int colAdj = 1;
         if (!g_dumpInLooseModeFlag) {
             avro_value_get_by_name(&value, "tbname", &tbname_value, NULL);
@@ -6151,38 +6157,8 @@ static int64_t dumpInAvroDataImpl(
             avro_value_get_string(&tbname_branch,
                     (const char **)&tbName, &tbname_size);
         } else {
-            tbName = malloc(TSDB_TABLE_NAME_LEN);
-            ASSERT(tbName);
-
-            char *dupSeq = strdup(fileName);
-            char *running = dupSeq;
-            strsep(&running, ".");
-            char *tb = strsep(&running, ".");
-
-            strcpy(tbName, tb);
-            free(dupSeq);
+            tbName = tbNameOutWhile;
             colAdj = 0;
-        }
-        debugPrint("%s() LN%d table: %s parsed from file:%s\n",
-                __func__, __LINE__, tbName, fileName);
-
-        char *escapedTbName = calloc(1, TSDB_DB_NAME_LEN + TSDB_TABLE_NAME_LEN + 3);
-        if (NULL == escapedTbName) {
-            errorPrint("%s() LN%d, memory allocation failed!\n", __func__, __LINE__);
-            free(bindArray);
-            free(stmtBuffer);
-            free(tableDes);
-            tfree(tbName);
-#ifdef WEBSOCKET
-            if (g_args.cloud || g_args.restful) {
-                ws_stmt_close(ws_stmt);
-            } else {
-#endif
-                taos_stmt_close(stmt);
-#ifdef WEBSOCKET
-            }
-#endif
-            return -1;
         }
 
 #ifdef WEBSOCKET
@@ -6200,10 +6176,6 @@ static int64_t dumpInAvroDataImpl(
                         " ws_taos: %p, code: 0x%08x, reason: %s\n",
                         __func__, __LINE__,
                         escapedTbName, taos, code, ws_errstr(ws_stmt));
-                free(escapedTbName);
-                if (g_dumpInLooseModeFlag) {
-                    free(tbName);
-                }
                 continue;
             }
             debugPrint("%s() LN%d, stmt: %p, ws_stmt_set_tbname(%s) done\n",
@@ -6220,16 +6192,11 @@ static int64_t dumpInAvroDataImpl(
                 errorPrint("Failed to execute taos_stmt_set_tbname(%s)."
                         "reason: %s\n",
                         escapedTbName, taos_stmt_errstr(stmt));
-                free(escapedTbName);
-                if (g_dumpInLooseModeFlag) {
-                    free(tbName);
-                }
                 continue;
             }
 #ifdef WEBSOCKET
         }
 #endif
-        free(escapedTbName);
 
         if ((0 == strlen(tableDes->name))
                 || (0 != strcmp(tableDes->name, tbName))) {
@@ -6934,7 +6901,6 @@ static int64_t dumpInAvroDataImpl(
         }
 
         debugPrint2("%s", "\n");
-
 #ifdef WEBSOCKET
         if (g_args.cloud || g_args.restful) {
             if (0 != (code = ws_stmt_bind_param_batch(ws_stmt,
@@ -6969,6 +6935,7 @@ static int64_t dumpInAvroDataImpl(
             }
         } else {
 #endif
+            t4 += getTimeCostUsfromLastCall(&tNowUs);
             if (0 != taos_stmt_bind_param_batch(stmt,
                     (TAOS_MULTI_BIND *)bindArray)) {
                 errorPrint("%s() LN%d stmt_bind_param_batch() failed! "
@@ -6976,61 +6943,65 @@ static int64_t dumpInAvroDataImpl(
                             __func__, __LINE__, taos_stmt_errstr(stmt));
                 freeBindArray(bindArray, onlyCol);
                 failed++;
-                if (g_dumpInLooseModeFlag) {
-                    tfree(tbName);
-                }
                 continue;
             }
-
+            t1 += getTimeCostUsfromLastCall(&tNowUs);
             if (0 != taos_stmt_add_batch(stmt)) {
                 errorPrint("%s() LN%d stmt_bind_param() failed! reason: %s\n",
                         __func__, __LINE__, taos_stmt_errstr(stmt));
                 freeBindArray(bindArray, onlyCol);
                 failed++;
-                if (g_dumpInLooseModeFlag) {
-                    tfree(tbName);
-                }
                 continue;
             }
-            if (0 != taos_stmt_execute(stmt)) {
+            t2 += getTimeCostUsfromLastCall(&tNowUs);
+            waitCount++;
+            if (waitCount % 10 == 0 && 0 != taos_stmt_execute(stmt)) {
+                waitCount = 0;
                 errorPrint("%s() LN%d taos_stmt_execute() failed! "
                            "reason: %s, timestamp: %"PRId64"\n",
                         __func__, __LINE__, taos_stmt_errstr(stmt), ts_debug);
                 failed -= stmt_count;
                 break;
             } else {
-                success++;
+              infoPrint("%s() LN%d, stmt buffer: %s while end tbdesc:%s tbname:%s\n", __func__,
+                        __LINE__, stmtBuffer, tableDes->name, tbName);
+                success += waitCount;
+              if (success >= 10) return success;
             }
+            t3 += getTimeCostUsfromLastCall(&tNowUs);
 #ifdef WEBSOCKET
         }
 #endif
         freeBindArray(bindArray, onlyCol);
-
-        if (g_dumpInLooseModeFlag) {
-            tfree(tbName);
-        }
     }
+    infoPrint("%s() LN%d, stmt buffer: %s while end count:%d t1:%d t2:%d t3:%d t4:%d us\n", __func__, __LINE__, stmtBuffer, count,
+              t1, t2, t3, t4);
 
+    infoPrint("%s() LN%d, stmt buffer: %s while end count:%d cost:%d us\n", __func__, __LINE__, stmtBuffer, count,
+              getTimeCostUsfromLastCall(&tNowUs));
     avro_value_decref(&value);
     avro_value_iface_decref(value_class);
 
-    tfree(bindArray);
-
-    tfree(stmtBuffer);
     freeTbDes(tableDes);
-#ifdef WEBSOCKET
-    if (g_args.cloud || g_args.restful) {
-        ws_stmt_close(ws_stmt);
-    } else {
-#endif
-        taos_stmt_close(stmt);
-#ifdef WEBSOCKET
-    }
-#endif
+    tableDes = NULL;
 
-    if (failed)
-        return (-failed);
-    return success;
+preExit:
+  tfree(stmtBuffer);
+  tfree(tableDes);
+  tfree(escapedTbName);
+  tfree(bindArray);
+  tfree(tbNameOutWhile);
+#ifdef WEBSOCKET
+  if (g_args.cloud || g_args.restful) {
+    ws_stmt_close(ws_stmt);
+  } else {
+#endif
+    taos_stmt_close(stmt);
+#ifdef WEBSOCKET
+  }
+#endif
+  if (failed) return (-failed);
+  return success;
 }
 
 static RecordSchema *getSchemaAndReaderFromFile(
@@ -7136,6 +7107,7 @@ static int64_t dumpInOneAvroFile(
         char *fileName) {
     char avroFile[MAX_PATH_LEN];
     sprintf(avroFile, "%s/%s", dbPath, fileName);
+    int64_t tNow = toolsGetTimestampMs();
 
     debugPrint("avroFile: %s\n", avroFile);
 
@@ -7150,8 +7122,8 @@ static int64_t dumpInOneAvroFile(
     }
 
     const char *namespace = avro_schema_namespace((const avro_schema_t)schema);
-    debugPrint("%s() LN%d, Namespace: %s\n",
-            __func__, __LINE__, namespace);
+    infoPrint("%s() LN%d start, Namespace: %s cost:%d ms\n",
+            __func__, __LINE__, namespace, getTimeCostMsfromLastCall(&tNow));
 
     TAOS *taos = NULL;
     void *taos_v = NULL;
@@ -7175,44 +7147,50 @@ static int64_t dumpInOneAvroFile(
     int64_t retExec = 0;
     switch (avroType) {
         case AVRO_DATA:
-            debugPrint("%s() LN%d will dump %s's data\n",
-                    __func__, __LINE__, namespace);
+        infoPrint("%s() LN%d will dump %s's data, cost:%d ms\n", __func__, __LINE__, namespace,
+                     getTimeCostMsfromLastCall(&tNow));
             retExec = dumpInAvroDataImpl(taos_v,
                     (char *)namespace,
-                    schema, reader, recordSchema,
-                    fileName);
+                    schema, reader, recordSchema, fileName);
+        infoPrint("%s() LN%d dump %s's data, cost:%d ms\n", __func__, __LINE__, namespace,
+                  getTimeCostMsfromLastCall(&tNow));
             break;
 
         case AVRO_TBTAGS:
-            debugPrint("%s() LN%d will dump %s's normal table with tags\n",
-                    __func__, __LINE__, namespace);
+          infoPrint("%s() LN%d will dump %s's normal table with tags, cost:%d ms\n", __func__, __LINE__, namespace,
+                     getTimeCostMsfromLastCall(&tNow));
             retExec = dumpInAvroTbTagsImpl(
                     taos_v,
                     (char *)namespace,
                     schema, reader,
                     fileName,
                     recordSchema);
+          infoPrint("%s() LN%d dump %s's normal table with tags, cost:%d ms\n", __func__, __LINE__, namespace,
+                    getTimeCostMsfromLastCall(&tNow));
             break;
 
         case AVRO_NTB:
-            debugPrint("%s() LN%d will dump %s's normal tables\n",
-                    __func__, __LINE__, namespace);
+          infoPrint("%s() LN%d will dump %s's normal tables, cost:%d ms\n", __func__, __LINE__, namespace,
+                     getTimeCostMsfromLastCall(&tNow));
             retExec = dumpInAvroNtbImpl(taos_v,
                     (char *)namespace,
                     schema, reader, recordSchema);
             break;
 
         default:
-            errorPrint("%s() LN%d input mistake list: %d\n",
-                    __func__, __LINE__, avroType);
+            errorPrint("%s() LN%d input mistake list: %d, cost:%d ms\n", __func__, __LINE__,
+                     avroType, getTimeCostMsfromLastCall(&tNow));
             retExec = -1;
     }
 
     closeTaosConnWrapper(taos_v);
-
+    infoPrint("%s() LN%d end, Namespace: %s, closeTaosConnWrapper cost:%d ms\n", __func__, __LINE__, namespace,
+              getTimeCostMsfromLastCall(&tNow));
     freeRecordSchema(recordSchema);
     avro_schema_decref(schema);
     avro_file_reader_close(reader);
+    infoPrint("%s() LN%d end, Namespace: %s, cost:%d ms\n",
+            __func__, __LINE__, namespace, getTimeCostMsfromLastCall(&tNow));
 
     return retExec;
 }
@@ -7247,11 +7225,13 @@ static void* dumpInAvroWorkThreadFp(void *arg) {
     int currentPercent = 0;
     int percentComplete = 0;
 
+    int64_t tNow = toolsGetTimestampMs();
     for (int64_t i = 0; i < pThreadInfo->count; i++) {
         if (0 == currentPercent) {
-            infoPrint("[%d]: Restoring from %s ...\n",
+            infoPrint("[%d]: Restoring from %s cost:%d ms ...\n",
                     pThreadInfo->threadIndex,
-                    fileList[pThreadInfo->from + i]);
+                    fileList[pThreadInfo->from + i], 
+                    getTimeCostMsfromLastCall(&tNow));
         }
 
         int64_t rows = dumpInOneAvroFile(
@@ -7259,6 +7239,8 @@ static void* dumpInAvroWorkThreadFp(void *arg) {
                 pThreadInfo->avroType,
                 g_dumpInCharset,
                 fileList[pThreadInfo->from + i]);
+
+        infoPrint("[%d]: dumpInOneAvroFile, cost:%d ms ...\n", pThreadInfo->threadIndex, getTimeCostMsfromLastCall(&tNow));
         if (rows < 0) {
             errorPrint("%s() LN%d, failed to dump file: %s\n", __func__, __LINE__,
                                 fileList[pThreadInfo->from +i]);
@@ -7295,25 +7277,25 @@ static void* dumpInAvroWorkThreadFp(void *arg) {
             switch (pThreadInfo->avroType) {
                 case AVRO_DATA:
                     atomic_add_fetch_64(&g_totalDumpInRecSuccess, rows);
-                    okPrint("[%d] %"PRId64" row(s) of file(%s) be successfully dumped in!\n",
+                    okPrint("[%d] %"PRId64" row(s) of file(%s) be successfully dumped in! cost:%d ms\n",
                                          pThreadInfo->threadIndex, rows,
-                                         fileList[pThreadInfo->from + i]);
+                                         fileList[pThreadInfo->from + i], getTimeCostMsfromLastCall(&tNow));
                     break;
 
                 case AVRO_TBTAGS:
                     atomic_add_fetch_64(&g_totalDumpInStbSuccess, rows);
                     okPrint("[%d] %"PRId64""
-                                         "table(s) belong stb from the file(%s) be successfully dumped in!\n",
+                                         "table(s) belong stb from the file(%s) be successfully dumped in! cost:%d ms\n",
                                          pThreadInfo->threadIndex, rows,
-                                         fileList[pThreadInfo->from + i]);
+                                         fileList[pThreadInfo->from + i], getTimeCostMsfromLastCall(&tNow));
                     break;
 
                 case AVRO_NTB:
                     atomic_add_fetch_64(&g_totalDumpInNtbSuccess, rows);
                     okPrint("[%d] %"PRId64" "
-                                         "normal table(s) from (%s) be successfully dumped in!\n",
+                                         "normal table(s) from (%s) be successfully dumped in! cost:%d ms\n",
                                          pThreadInfo->threadIndex, rows,
-                                         fileList[pThreadInfo->from + i]);
+                                         fileList[pThreadInfo->from + i], getTimeCostMsfromLastCall(&tNow));
                     break;
 
                 default:
@@ -7325,8 +7307,8 @@ static void* dumpInAvroWorkThreadFp(void *arg) {
 
         currentPercent = ((i+1) * 100 / pThreadInfo->count);
         if (currentPercent > percentComplete) {
-            infoPrint("[%d]:%d%%\n",
-                    pThreadInfo->threadIndex, currentPercent);
+            infoPrint("[%d]:%d%% cost:%d ms\n",
+                    pThreadInfo->threadIndex, currentPercent, getTimeCostMsfromLastCall(&tNow));
             percentComplete = currentPercent;
         }
     }
@@ -9938,6 +9920,11 @@ static void* dumpInDebugWorkThreadFp(void *arg) {
                     pThreadInfo->from);
 
     for (int64_t i = 0; i < pThreadInfo->count; i++) {
+        clock_t begin, end;
+      double  costtime;
+        //开始记录
+        begin = clock();
+
         char sqlFile[MAX_PATH_LEN];
         sprintf(sqlFile, "%s/%s", pThreadInfo->dbPath,
                 g_tsDumpInDebugFiles[pThreadInfo->from + i]);
@@ -9948,15 +9935,26 @@ static void* dumpInDebugWorkThreadFp(void *arg) {
                     pThreadInfo->threadIndex, sqlFile);
             continue;
         }
+        // openfilecost
+        end = clock();
+        costtime = (double)(end - begin) / CLOCKS_PER_SEC;
+        infoPrint("[%d] openfilecost:%f \n", pThreadInfo->threadIndex, costtime);
+        begin = end;
 
         int64_t rows = dumpInOneDebugFile(
                 pThreadInfo->taos, fp, g_dumpInCharset,
                 sqlFile);
 
+        // openfilecost
+        end = clock();
+        costtime = (double)(end - begin) / CLOCKS_PER_SEC;
+        infoPrint("[%d] dumpInOneDebugFile:%f \n", pThreadInfo->threadIndex, costtime);
+        begin = end;
+
         if (rows > 0) {
             atomic_add_fetch_64(&pThreadInfo->recSuccess, rows);
             okPrint("[%d] Total %"PRId64" line(s) "
-                    "command be successfully dumped in file: %s\n",
+                    "command be successfully dumped in file1: %s\n",
                     pThreadInfo->threadIndex, rows, sqlFile);
         } else if (rows < 0) {
             atomic_add_fetch_64(&pThreadInfo->recFailed, rows);
@@ -9964,7 +9962,10 @@ static void* dumpInDebugWorkThreadFp(void *arg) {
                     "command failed to dump in file: %s\n",
                     pThreadInfo->threadIndex, rows, sqlFile);
         }
-        fclose(fp);
+        // openfilecost
+        end = clock();
+        costtime = (double)(end - begin) / CLOCKS_PER_SEC;
+        infoPrint("[%d] atomic_add_fetch_64:%f \n", pThreadInfo->threadIndex, costtime);
     }
 
     return NULL;
@@ -10186,13 +10187,17 @@ static int dumpInWithDbPath(const char *dbPath) {
 
     if (g_args.avro) {
         ret = dumpInAvroWorkThreads(dbPath, "avro-tbtags");
+        infoPrint("dbpath:%s %s", dbPath, "dumpInAvroWorkThreads avro-tbtags finish!\n");
 
         if (0 == ret) {
             ret = dumpInAvroWorkThreads(dbPath, "avro-ntb");
+            infoPrint("dbpath:%s %s", dbPath, "dumpInAvroWorkThreads avro-ntb finish!\n");
 
             if (0 == ret) {
                 ret = dumpInAvroWorkThreads(dbPath, "avro");
+                infoPrint("dbpath:%s %s", dbPath, "dumpInAvroWorkThreads avro finish!\n");
                 ret = dumpInAvroWorkThreadsSub(dbPath, "avro");
+                infoPrint("dbpath:%s %s", dbPath, "dumpInAvroWorkThreadsSub avro finish!\n");
             }
         }
     } else {

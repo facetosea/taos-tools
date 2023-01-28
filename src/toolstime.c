@@ -829,3 +829,19 @@ FORCE_INLINE int64_t toolsGetTimestampNs() {
 }
 
 FORCE_INLINE void toolsMsleep(int32_t mseconds) { usleep(mseconds * 1000); }
+
+int64_t getTimeCostMsfromLastCall(int64_t* lastTimeMs) {
+  if (NULL == lastTimeMs) return 0;
+  int64_t now = toolsGetTimestampMs();
+  int64_t cost = now - *lastTimeMs;
+  *lastTimeMs = now;
+  return cost;
+}
+
+int64_t getTimeCostUsfromLastCall(int64_t* lastTimeUs) {
+  if (NULL == lastTimeUs) return 0;
+  int64_t now = toolsGetTimestampUs();
+  int64_t cost = now - *lastTimeUs;
+  *lastTimeUs = now;
+  return cost;
+}
